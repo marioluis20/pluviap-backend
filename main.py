@@ -96,6 +96,65 @@ LAT_MARIATO = 7.65
 LON_MARIATO = -81.00
 TIMEZONE_MARIATO = "America/Panama"
 
+            # ============================================================
+            # CACHE SIMPLE PARA EVITAR EXCESO DE CONSULTAS A APIs EXTERNAS
+            # ============================================================
+
+CACHE_FUENTES = {}
+
+
+def obtener_con_cache(nombre, ttl_minutos, funcion):
+    """
+    Ejecuta una función externa usando caché temporal.
+
+    - Si hay dato reciente en caché, lo reutiliza.
+    - Si no hay caché, consulta la fuente externa.
+    - Si la fuente falla pero existe caché previa, usa la caché.
+    - Si no hay caché y la fuente falla, lanza el error.
+    """
+
+    ahora = datetime.now()
+
+    if nombre in CACHE_FUENTES:
+        item = CACHE_FUENTES[nombre]
+        edad = ahora - item["fecha"]
+
+        if edad < timedelta(minutes=ttl_minutos):
+            resultado = dict(item["resultado"])
+            resultado["_cache"] = True
+            resultado["_cache_estado"] = "cache_vigente"
+            resultado["_cache_edad_minutos"] = round(edad.total_seconds() / 60, 2)
+            return resultado
+
+    try:
+        resultado = funcion()
+        resultado = dict(resultado)
+
+        CACHE_FUENTES[nombre] = {
+            "fecha": ahora,
+            "resultado": resultado
+        }
+
+        resultado["_cache"] = False
+        resultado["_cache_estado"] = "consulta_nueva"
+        resultado["_cache_edad_minutos"] = 0
+
+        return resultado
+
+    except Exception as e:
+        if nombre in CACHE_FUENTES:
+            item = CACHE_FUENTES[nombre]
+            edad = ahora - item["fecha"]
+
+            resultado = dict(item["resultado"])
+            resultado["_cache"] = True
+            resultado["_cache_estado"] = "cache_por_error_fuente"
+            resultado["_cache_edad_minutos"] = round(edad.total_seconds() / 60, 2)
+            resultado["_cache_error"] = f"{type(e).__name__}: {str(e)}"
+
+            return resultado
+
+        raise e
 
 def sumar_precipitacion_por_rango(times, values, inicio, fin):
     """
@@ -240,13 +299,92 @@ def calcular_api_proxy_lluvia(lluvia_1d, lluvia_3d, lluvia_7d):
 def obtener_datos_actuales_mariato():
     """
     Construye las variables actuales que necesita el modelo V2.1
-    usando fuentes gratuitas disponibles.
+    usando fuentes gratuitas y caché para evitar límites de uso.
     """
 
-    lluvia = obtener_lluvia_open_meteo()
-    enso = obtener_enso_noaa()
-    marea = obtener_marea_open_meteo()
-    ciclon = obtener_sistema_tropical_nhc()
+    errores_fuentes = []
+
+    # =========================
+    # LLUVIA - OPEN-METEO
+    # =========================
+    try:
+        lluvia = obtener_con_cache(
+            nombre="lluvia_open_meteo",
+            ttl_minutos=60,
+            funcion=obtener_lluvia_open_meteo
+        )
+        fuente_lluvia = "Open-Meteo"
+
+    except Exception as e:
+        errores_fuentes.append(f"lluvia_open_meteo: {type(e).__name__}: {str(e)}")
+
+        lluvia = {
+            "lluvia_1d": 12.4,
+            "lluvia_3d": 34.8,
+            "lluvia_7d": 68.2,
+            "detalle_lluvia": {
+                "modo": "respaldo_local_por_error_open_meteo"
+            },
+            "_cache": False,
+            "_cache_estado": "respaldo_local"
+        }
+        fuente_lluvia = "respaldo_local_lluvia"
+
+    # =========================
+    # ENSO - NOAA CPC
+    # =========================
+    try:
+        enso = obtener_con_cache(
+            nombre="enso_noaa_cpc",
+            ttl_minutos=360,
+            funcion=obtener_enso_noaa
+        )
+    except Exception as e:
+        errores_fuentes.append(f"enso_noaa: {type(e).__name__}: {str(e)}")
+
+        enso = {
+            "fase_enso": "Neutral",
+            "anomalia_nino34": 0.10,
+            "fuente_enso": "respaldo_local"
+        }
+
+    # =========================
+    # MAREA - OPEN-METEO MARINE
+    # =========================
+    try:
+        marea = obtener_con_cache(
+            nombre="marea_open_meteo_marine",
+            ttl_minutos=30,
+            funcion=obtener_marea_open_meteo
+        )
+    except Exception as e:
+        errores_fuentes.append(f"marea_open_meteo_marine: {type(e).__name__}: {str(e)}")
+
+        marea = {
+            "marea_alta": 0,
+            "marea_estado": "Normal",
+            "nivel_mar_proxy": None,
+            "fuente_marea": "respaldo_local"
+        }
+
+    # =========================
+    # CICLONES - NOAA NHC
+    # =========================
+    try:
+        ciclon = obtener_con_cache(
+            nombre="ciclones_noaa_nhc",
+            ttl_minutos=30,
+            funcion=obtener_sistema_tropical_nhc
+        )
+    except Exception as e:
+        errores_fuentes.append(f"ciclones_noaa_nhc: {type(e).__name__}: {str(e)}")
+
+        ciclon = {
+            "sistema_tropical_activo": 0,
+            "nombre_sistema_tropical": None,
+            "fuente_ciclones": "respaldo_local",
+            "detalle_ciclones": "error_consulta"
+        }
 
     lluvia_1d = lluvia["lluvia_1d"]
     lluvia_3d = lluvia["lluvia_3d"]
@@ -263,7 +401,7 @@ def obtener_datos_actuales_mariato():
         "lluvia_3d": lluvia_3d,
         "lluvia_7d": lluvia_7d,
 
-        # Aún son aproximaciones hasta conectar histórico diario 15/30 días.
+        # Aproximación temporal hasta conectar histórico 15/30 días.
         "lluvia_15d": lluvia_7d,
         "lluvia_30d": lluvia_7d,
 
@@ -279,14 +417,23 @@ def obtener_datos_actuales_mariato():
     }
 
     datos["_fuentes"] = {
-        "lluvia": "Open-Meteo",
+        "lluvia": fuente_lluvia,
         "enso": enso.get("fuente_enso"),
         "marea": marea.get("fuente_marea"),
         "ciclones": ciclon.get("fuente_ciclones"),
+
         "marea_estado": marea.get("marea_estado"),
         "nivel_mar_proxy": marea.get("nivel_mar_proxy"),
+
         "nombre_sistema_tropical": ciclon.get("nombre_sistema_tropical"),
-        "detalle_ciclones": ciclon.get("detalle_ciclones")
+        "detalle_ciclones": ciclon.get("detalle_ciclones"),
+
+        "cache_lluvia": lluvia.get("_cache_estado"),
+        "cache_enso": enso.get("_cache_estado"),
+        "cache_marea": marea.get("_cache_estado"),
+        "cache_ciclones": ciclon.get("_cache_estado"),
+
+        "errores_fuentes": errores_fuentes
     }
 
     return datos
@@ -1000,10 +1147,16 @@ def current_prediction():
         respuesta["fuenteDatos"] = "Open-Meteo + NOAA CPC + Open-Meteo Marine + NOAA NHC"
         respuesta["tipoDatos"] = "datos_hidrometeorologicos_actuales"
 
-        respuesta["fuenteLluvia"] = fuentes.get("lluvia", "Open-Meteo")
+        respuesta["fuenteLluvia"] = fuentes.get("lluvia")
         respuesta["fuenteEnso"] = fuentes.get("enso")
         respuesta["fuenteMarea"] = fuentes.get("marea")
         respuesta["fuenteCiclones"] = fuentes.get("ciclones")
+
+        respuesta["cacheLluvia"] = fuentes.get("cache_lluvia")
+        respuesta["cacheEnso"] = fuentes.get("cache_enso")
+        respuesta["cacheMarea"] = fuentes.get("cache_marea")
+        respuesta["cacheCiclones"] = fuentes.get("cache_ciclones")
+        respuesta["erroresFuentes"] = fuentes.get("errores_fuentes", [])
 
         respuesta["mareaEstado"] = fuentes.get(
             "marea_estado",
@@ -1092,22 +1245,38 @@ def weather_debug():
 def sources_debug():
     lluvia = probar_fuente_segura(
         "Open-Meteo lluvia",
-        obtener_lluvia_open_meteo
+        lambda: obtener_con_cache(
+            nombre="lluvia_open_meteo",
+            ttl_minutos=60,
+            funcion=obtener_lluvia_open_meteo
+        )
     )
 
     enso = probar_fuente_segura(
         "NOAA CPC ENSO",
-        obtener_enso_noaa
+        lambda: obtener_con_cache(
+            nombre="enso_noaa_cpc",
+            ttl_minutos=360,
+            funcion=obtener_enso_noaa
+        )
     )
 
     marea = probar_fuente_segura(
         "Open-Meteo Marine",
-        obtener_marea_open_meteo
+        lambda: obtener_con_cache(
+            nombre="marea_open_meteo_marine",
+            ttl_minutos=30,
+            funcion=obtener_marea_open_meteo
+        )
     )
 
     ciclon = probar_fuente_segura(
         "NOAA NHC ciclones",
-        obtener_sistema_tropical_nhc
+        lambda: obtener_con_cache(
+            nombre="ciclones_noaa_nhc",
+            ttl_minutos=30,
+            funcion=obtener_sistema_tropical_nhc
+        )
     )
 
     return {
