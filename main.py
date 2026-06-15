@@ -275,6 +275,131 @@ def obtener_lluvia_open_meteo():
         }
     }
 
+def obtener_lluvia_nasa_power():
+    """
+    Fuente secundaria gratuita para precipitación diaria usando NASA POWER.
+
+    Nota:
+    - NASA POWER no reemplaza el pronóstico horario de Open-Meteo.
+    - Sirve como respaldo estable de lluvia diaria observada/modelada.
+    - Se usa cuando Open-Meteo devuelve 429 o falla desde Render.
+    """
+
+    hoy = datetime.now().date()
+    inicio = hoy - timedelta(days=10)
+
+    url = "https://power.larc.nasa.gov/api/temporal/daily/point"
+
+    params = {
+        "parameters": "PRECTOTCORR",
+        "community": "AG",
+        "longitude": LON_MARIATO,
+        "latitude": LAT_MARIATO,
+        "start": inicio.strftime("%Y%m%d"),
+        "end": hoy.strftime("%Y%m%d"),
+        "format": "JSON"
+    }
+
+    response = requests.get(url, params=params, timeout=25)
+    response.raise_for_status()
+
+    data = response.json()
+
+    valores = (
+        data.get("properties", {})
+            .get("parameter", {})
+            .get("PRECTOTCORR", {})
+    )
+
+    if not valores:
+        raise ValueError("NASA POWER no devolvió datos de precipitación PRECTOTCORR.")
+
+    datos_validos = []
+
+    for fecha, valor in valores.items():
+        try:
+            lluvia = float(valor)
+
+            # NASA puede usar valores negativos o -999 como faltantes.
+            if lluvia >= 0:
+                datos_validos.append((fecha, lluvia))
+        except Exception:
+            continue
+
+    if not datos_validos:
+        raise ValueError("NASA POWER no devolvió precipitación válida.")
+
+    datos_validos = sorted(datos_validos, key=lambda x: x[0])
+
+    ultimos_valores = [v for _, v in datos_validos]
+
+    lluvia_1d = sum(ultimos_valores[-1:])
+    lluvia_3d = sum(ultimos_valores[-3:])
+    lluvia_7d = sum(ultimos_valores[-7:])
+
+    return {
+        "lluvia_1d": round(float(lluvia_1d), 2),
+        "lluvia_3d": round(float(lluvia_3d), 2),
+        "lluvia_7d": round(float(lluvia_7d), 2),
+        "detalle_lluvia": {
+            "fuente": "NASA POWER",
+            "tipo": "precipitacion_diaria_respaldo",
+            "dias_disponibles": len(datos_validos),
+            "ultimo_dia": datos_validos[-1][0],
+            "nota": "NASA POWER se usa como respaldo cuando Open-Meteo falla o devuelve 429."
+        }
+    }
+
+def obtener_lluvia_operativa():
+    """
+    Obtiene lluvia para PLUVIAP con estrategia robusta:
+
+    1. Intenta Open-Meteo con caché.
+    2. Si Open-Meteo falla, usa NASA POWER con caché.
+    3. Si ambas fallan, devuelve ok=False para que el sistema use respaldo local.
+    """
+
+    try:
+        lluvia = obtener_con_cache(
+            nombre="lluvia_open_meteo",
+            ttl_minutos=60,
+            funcion=obtener_lluvia_open_meteo
+        )
+
+        return {
+            "ok": True,
+            "fuente": "Open-Meteo",
+            "resultado": lluvia,
+            "error_primario": None
+        }
+
+    except Exception as e_open:
+        error_open = f"{type(e_open).__name__}: {str(e_open)}"
+
+        try:
+            lluvia = obtener_con_cache(
+                nombre="lluvia_nasa_power",
+                ttl_minutos=360,
+                funcion=obtener_lluvia_nasa_power
+            )
+
+            return {
+                "ok": True,
+                "fuente": "NASA POWER",
+                "resultado": lluvia,
+                "error_primario": error_open
+            }
+
+        except Exception as e_nasa:
+            error_nasa = f"{type(e_nasa).__name__}: {str(e_nasa)}"
+
+            return {
+                "ok": False,
+                "fuente": "sin_fuente_lluvia",
+                "resultado": None,
+                "error_primario": error_open,
+                "error_secundario": error_nasa
+            }
 
 def calcular_api_proxy_lluvia(lluvia_1d, lluvia_3d, lluvia_7d):
     """
@@ -305,29 +430,38 @@ def obtener_datos_actuales_mariato():
     errores_fuentes = []
 
     # =========================
-    # LLUVIA - OPEN-METEO
+    # LLUVIA - OPEN-METEO / NASA POWER
     # =========================
-    try:
-        lluvia = obtener_con_cache(
-            nombre="lluvia_open_meteo",
-            ttl_minutos=60,
-            funcion=obtener_lluvia_open_meteo
-        )
-        fuente_lluvia = "Open-Meteo"
+    lluvia_operativa = obtener_lluvia_operativa()
 
-    except Exception as e:
-        errores_fuentes.append(f"lluvia_open_meteo: {type(e).__name__}: {str(e)}")
+    if lluvia_operativa["ok"]:
+        lluvia = lluvia_operativa["resultado"]
+        fuente_lluvia = lluvia_operativa["fuente"]
+
+        if lluvia_operativa.get("error_primario"):
+            errores_fuentes.append(
+                f"open_meteo_lluvia: {lluvia_operativa['error_primario']}"
+            )
+
+    else:
+        errores_fuentes.append(
+            f"open_meteo_lluvia: {lluvia_operativa.get('error_primario')}"
+        )
+        errores_fuentes.append(
+            f"nasa_power_lluvia: {lluvia_operativa.get('error_secundario')}"
+        )
 
         lluvia = {
             "lluvia_1d": 12.4,
             "lluvia_3d": 34.8,
             "lluvia_7d": 68.2,
             "detalle_lluvia": {
-                "modo": "respaldo_local_por_error_open_meteo"
+                "modo": "respaldo_local_por_error_total_lluvia"
             },
             "_cache": False,
             "_cache_estado": "respaldo_local"
         }
+
         fuente_lluvia = "respaldo_local_lluvia"
 
     # =========================
@@ -1244,12 +1378,8 @@ def weather_debug():
 @app.get("/sources-debug")
 def sources_debug():
     lluvia = probar_fuente_segura(
-        "Open-Meteo lluvia",
-        lambda: obtener_con_cache(
-            nombre="lluvia_open_meteo",
-            ttl_minutos=60,
-            funcion=obtener_lluvia_open_meteo
-        )
+        "Lluvia operativa Open-Meteo/NASA POWER",
+        obtener_lluvia_operativa
     )
 
     enso = probar_fuente_segura(
@@ -1282,7 +1412,7 @@ def sources_debug():
     return {
         "ubicacion": "Mariato, Veraguas, Panamá",
         "fechaConsulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "lluvia_open_meteo": lluvia,
+        "lluvia_operativa": lluvia,
         "enso_noaa": enso,
         "marea_open_meteo_marine": marea,
         "ciclones_noaa_nhc": ciclon
