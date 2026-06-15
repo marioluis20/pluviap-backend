@@ -926,6 +926,21 @@ def predecir_v21(datos_usuario: Dict[str, Any]):
         "fechaActualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+def probar_fuente_segura(nombre, funcion):
+    try:
+        resultado = funcion()
+        return {
+            "ok": True,
+            "fuente": nombre,
+            "resultado": resultado
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "fuente": nombre,
+            "errorTipo": type(e).__name__,
+            "errorMensaje": str(e)
+        }
 
 # ============================================================
 # ENDPOINTS
@@ -1024,13 +1039,29 @@ def current_prediction():
         respuesta["tipoDatos"] = "fallback"
         respuesta["mensaje"] = "No se pudieron consultar datos actuales. Mostrando predicción de respaldo."
         respuesta["fechaActualizacion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        respuesta["errorDatosActuales"] = f"{type(e).__name__}: {str(e)}"
 
         return respuesta
 
 
 @app.get("/weather-debug")
 def weather_debug():
-    lluvia = obtener_lluvia_open_meteo()
+    resultado = probar_fuente_segura(
+        "Open-Meteo lluvia",
+        obtener_lluvia_open_meteo
+    )
+
+    if not resultado["ok"]:
+        return {
+            "ubicacion": "Mariato, Veraguas, Panamá",
+            "estado": "error",
+            "fuente": "Open-Meteo",
+            "errorTipo": resultado["errorTipo"],
+            "errorMensaje": resultado["errorMensaje"],
+            "fechaConsulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    lluvia = resultado["resultado"]
 
     lluvia_1d = lluvia["lluvia_1d"]
     lluvia_3d = lluvia["lluvia_3d"]
@@ -1044,6 +1075,7 @@ def weather_debug():
 
     return {
         "ubicacion": "Mariato, Veraguas, Panamá",
+        "estado": "ok",
         "latitud": LAT_MARIATO,
         "longitud": LON_MARIATO,
         "fuente": "Open-Meteo",
@@ -1058,12 +1090,25 @@ def weather_debug():
 
 @app.get("/sources-debug")
 def sources_debug():
-    lluvia = obtener_lluvia_open_meteo()
+    lluvia = probar_fuente_segura(
+        "Open-Meteo lluvia",
+        obtener_lluvia_open_meteo
+    )
 
-    # Estas funciones deben existir más arriba en main.py.
-    enso = obtener_enso_noaa()
-    marea = obtener_marea_open_meteo()
-    ciclon = obtener_sistema_tropical_nhc()
+    enso = probar_fuente_segura(
+        "NOAA CPC ENSO",
+        obtener_enso_noaa
+    )
+
+    marea = probar_fuente_segura(
+        "Open-Meteo Marine",
+        obtener_marea_open_meteo
+    )
+
+    ciclon = probar_fuente_segura(
+        "NOAA NHC ciclones",
+        obtener_sistema_tropical_nhc
+    )
 
     return {
         "ubicacion": "Mariato, Veraguas, Panamá",
