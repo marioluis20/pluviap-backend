@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -97,6 +97,37 @@ LON_MARIATO = -81.00
 TIMEZONE_MARIATO = "America/Panama"
 
 # ============================================================
+# CONFIGURACIÓN RAIN MAP - ZONAS DE MARIATO
+# ============================================================
+
+RAIN_ZONES_MARIATO = [
+    {"nombre": "Mariato", "lat": 7.6500, "lon": -81.0000},
+    {"nombre": "Loma de Quebro", "lat": 7.5600, "lon": -80.9700},
+    {"nombre": "Río Quebro", "lat": 7.5400, "lon": -80.9800},
+    {"nombre": "Río Pavo", "lat": 7.4700, "lon": -80.9900},
+    {"nombre": "Arenas", "lat": 7.6000, "lon": -80.9000},
+    {"nombre": "El Cacao", "lat": 7.4300, "lon": -80.8800},
+    {"nombre": "Palo Seco / costa", "lat": 7.6200, "lon": -81.0700},
+    {"nombre": "Tebario", "lat": 7.7200, "lon": -80.9500},
+]
+
+# Caché exclusivo para Rain Map.
+# Evita consultar APIs meteorológicas cada vez que Android abra la pantalla.
+RAIN_MAP_CACHE = {}
+
+
+# ============================================================
+# CONFIGURACIÓN MET NORWAY API - RESPALDO PARA RAINSCREEN
+# ============================================================
+
+MET_NORWAY_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+
+# IMPORTANTE:
+# Cambia este correo por uno real tuyo o del proyecto.
+# MET Norway exige User-Agent identificable.
+MET_NORWAY_USER_AGENT = "PLUVIAP/1.0 contacto:marioluisluismario@gmail.com"
+
+# ============================================================
 # ZONAS MONITOREADAS PARA MAPA DE LLUVIA - RAINSCREEN
 # ============================================================
 
@@ -117,6 +148,14 @@ RAIN_ZONES_MARIATO = [
 
 CACHE_FUENTES = {}
 
+# ============================================================
+# CONFIGURACIÓN MET NORWAY API - RESPALDO PARA RAINSCREEN
+# ============================================================
+
+MET_NORWAY_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+
+# Cambia el correo por uno real del proyecto.
+MET_NORWAY_USER_AGENT = "PLUVIAP/1.0 contacto:tu_correo@correo.com"
 
 def obtener_con_cache(nombre, ttl_minutos, funcion):
     """
@@ -435,6 +474,366 @@ def calcular_api_proxy_lluvia(lluvia_1d, lluvia_3d, lluvia_7d):
 
     return round(float(api_normalizado), 2)
 
+# ============================================================
+# FUNCIONES RAIN MAP - OPEN-METEO + MET NORWAY
+# ============================================================
+
+def clasificar_lluvia_mm(mm: float) -> str:
+    """
+    Clasifica la precipitación acumulada en una ventana de 3 horas.
+    """
+    try:
+        mm = float(mm or 0.0)
+    except Exception:
+        mm = 0.0
+
+    if mm < 0.1:
+        return "sin_lluvia"
+    elif mm < 1:
+        return "mínima"
+    elif mm < 5:
+        return "baja"
+    elif mm < 15:
+        return "moderada"
+    elif mm < 25:
+        return "fuerte"
+    else:
+        return "intensa"
+
+
+def crear_rain_map_fallback(horizon_hours: int = 0):
+    """
+    Respuesta final si fallan Open-Meteo y MET Norway.
+    No debe interpretarse como 'no hay lluvia', sino como 'sin datos espaciales'.
+    """
+
+    horizon_hours = int(horizon_hours)
+
+    if horizon_hours not in [0, 3, 6, 9, 12]:
+        horizon_hours = 0
+
+    ahora = datetime.now()
+
+    zonas = [
+        {
+            "nombre": z["nombre"],
+            "lat": z["lat"],
+            "lon": z["lon"],
+            "precipitacionMm": 0.0,
+            "nivel": "sin_datos"
+        }
+        for z in RAIN_ZONES_MARIATO
+    ]
+
+    return {
+        "fechaActualizacion": ahora.strftime("%Y-%m-%d %H:%M:%S"),
+        "proximaActualizacion": (ahora + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+        "unidad": "mm",
+        "horizonteHoras": horizon_hours,
+        "fuenteDatos": "fallback_temporal",
+        "mensaje": "No se pudo consultar Open-Meteo ni MET Norway. Vista temporal sin lluvia real.",
+        "zonas": zonas,
+        "_cache": False,
+        "_cache_estado": "sin_cache",
+        "_cache_edad_minutos": 0
+    }
+
+
+def obtener_rain_map_open_meteo(horizon_hours: int = 0):
+    """
+    Consulta Open-Meteo para varias zonas de Mariato en una sola llamada.
+    Calcula acumulado de lluvia para ventanas de 3 horas:
+    0  = próximas 3 horas
+    3  = +3h a +6h
+    6  = +6h a +9h
+    9  = +9h a +12h
+    12 = +12h a +15h
+    """
+
+    horizon_hours = int(horizon_hours)
+
+    if horizon_hours not in [0, 3, 6, 9, 12]:
+        horizon_hours = 0
+
+    url = "https://api.open-meteo.com/v1/forecast"
+
+    latitudes = ",".join(str(z["lat"]) for z in RAIN_ZONES_MARIATO)
+    longitudes = ",".join(str(z["lon"]) for z in RAIN_ZONES_MARIATO)
+
+    params = {
+        "latitude": latitudes,
+        "longitude": longitudes,
+        "hourly": "precipitation",
+        "forecast_days": 2,
+        "timezone": TIMEZONE_MARIATO
+    }
+
+    response = requests.get(url, params=params, timeout=25)
+    response.raise_for_status()
+
+    data = response.json()
+
+    # Open-Meteo puede devolver lista cuando se consultan varias coordenadas.
+    respuestas = data if isinstance(data, list) else [data]
+
+    ahora = datetime.now()
+    inicio_ventana = ahora + timedelta(hours=horizon_hours)
+    fin_ventana = inicio_ventana + timedelta(hours=3)
+
+    zonas_resultado = []
+
+    for zona, respuesta_zona in zip(RAIN_ZONES_MARIATO, respuestas):
+        hourly = respuesta_zona.get("hourly", {})
+        tiempos_raw = hourly.get("time", [])
+        precipitaciones_raw = hourly.get("precipitation", [])
+
+        acumulado = 0.0
+
+        for tiempo_texto, valor in zip(tiempos_raw, precipitaciones_raw):
+            try:
+                tiempo = datetime.fromisoformat(tiempo_texto)
+
+                if inicio_ventana <= tiempo < fin_ventana:
+                    acumulado += float(valor or 0.0)
+
+            except Exception:
+                continue
+
+        acumulado = round(float(acumulado), 2)
+
+        zonas_resultado.append({
+            "nombre": zona["nombre"],
+            "lat": zona["lat"],
+            "lon": zona["lon"],
+            "precipitacionMm": acumulado,
+            "nivel": clasificar_lluvia_mm(acumulado)
+        })
+
+    return {
+        "fechaActualizacion": ahora.strftime("%Y-%m-%d %H:%M:%S"),
+        "proximaActualizacion": (ahora + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+        "unidad": "mm",
+        "horizonteHoras": horizon_hours,
+        "fuenteDatos": "Open-Meteo",
+        "mensaje": "Precipitación estimada por zonas monitoreadas.",
+        "zonas": zonas_resultado
+    }
+
+
+def parsear_fecha_met_norway(fecha_texto: str):
+    """
+    Convierte fechas ISO de MET Norway a datetime UTC.
+    Ejemplo:
+    2026-06-18T21:00:00Z
+    """
+    return datetime.fromisoformat(fecha_texto.replace("Z", "+00:00"))
+
+
+def obtener_rain_map_met_norway(horizon_hours: int = 0):
+    """
+    Consulta MET Norway Locationforecast para las zonas de Mariato.
+    Se usa como respaldo cuando Open-Meteo falla en Render.
+
+    MET Norway normalmente consulta una coordenada por solicitud,
+    por eso se hace una consulta por cada zona.
+    """
+
+    horizon_hours = int(horizon_hours)
+
+    if horizon_hours not in [0, 3, 6, 9, 12]:
+        horizon_hours = 0
+
+    ahora_utc = datetime.now(timezone.utc)
+    inicio_ventana = ahora_utc + timedelta(hours=horizon_hours)
+    fin_ventana = inicio_ventana + timedelta(hours=3)
+
+    headers = {
+        "User-Agent": MET_NORWAY_USER_AGENT,
+        "Accept": "application/json"
+    }
+
+    zonas_resultado = []
+
+    for zona in RAIN_ZONES_MARIATO:
+        params = {
+            "lat": zona["lat"],
+            "lon": zona["lon"]
+        }
+
+        response = requests.get(
+            MET_NORWAY_URL,
+            params=params,
+            headers=headers,
+            timeout=25
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        timeseries = (
+            data
+            .get("properties", {})
+            .get("timeseries", [])
+        )
+
+        acumulado = 0.0
+        encontro_1h = False
+        respaldo_6h = None
+
+        for item in timeseries:
+            try:
+                tiempo = parsear_fecha_met_norway(item["time"])
+                data_item = item.get("data", {})
+
+                # Caso ideal: MET Norway trae lluvia para la próxima hora.
+                if inicio_ventana <= tiempo < fin_ventana:
+                    next_1h = data_item.get("next_1_hours")
+
+                    if next_1h:
+                        detalles = next_1h.get("details", {})
+                        acumulado += float(detalles.get("precipitation_amount", 0.0) or 0.0)
+                        encontro_1h = True
+
+                # Respaldo: si no aparece next_1_hours, usamos next_6_hours prorrateado.
+                next_6h = data_item.get("next_6_hours")
+
+                if next_6h and respaldo_6h is None:
+                    tiempo_fin_6h = tiempo + timedelta(hours=6)
+
+                    if tiempo <= inicio_ventana < tiempo_fin_6h:
+                        detalles_6h = next_6h.get("details", {})
+                        lluvia_6h = float(detalles_6h.get("precipitation_amount", 0.0) or 0.0)
+                        respaldo_6h = lluvia_6h * 0.5
+
+            except Exception:
+                continue
+
+        if not encontro_1h and acumulado == 0.0 and respaldo_6h is not None:
+            acumulado = respaldo_6h
+
+        acumulado = round(float(acumulado), 2)
+
+        zonas_resultado.append({
+            "nombre": zona["nombre"],
+            "lat": zona["lat"],
+            "lon": zona["lon"],
+            "precipitacionMm": acumulado,
+            "nivel": clasificar_lluvia_mm(acumulado)
+        })
+
+    ahora_local = datetime.now()
+
+    return {
+        "fechaActualizacion": ahora_local.strftime("%Y-%m-%d %H:%M:%S"),
+        "proximaActualizacion": (ahora_local + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+        "unidad": "mm",
+        "horizonteHoras": horizon_hours,
+        "fuenteDatos": "MET Norway",
+        "mensaje": "Precipitación estimada por zonas monitoreadas usando MET Norway.",
+        "zonas": zonas_resultado
+    }
+
+
+def obtener_rain_map_operativo(horizon_hours: int = 0):
+    """
+    Obtiene mapa de lluvia por zonas con prioridad:
+    1. Open-Meteo
+    2. MET Norway
+    3. fallback_temporal
+    """
+
+    horizon_hours = int(horizon_hours)
+
+    if horizon_hours not in [0, 3, 6, 9, 12]:
+        horizon_hours = 0
+
+    ahora = datetime.now()
+
+    # ========================================================
+    # 1. INTENTAR OPEN-METEO CON CACHÉ
+    # ========================================================
+
+    cache_key_open = f"rain_map_open_meteo_h{horizon_hours}"
+
+    if cache_key_open in RAIN_MAP_CACHE:
+        cache = RAIN_MAP_CACHE[cache_key_open]
+        minutos = (ahora - cache["fecha"]).total_seconds() / 60
+
+        if minutos < 180:
+            data_cache = cache["data"].copy()
+            data_cache["_cache"] = True
+            data_cache["_cache_estado"] = "cache_vigente_open_meteo"
+            data_cache["_cache_edad_minutos"] = round(minutos, 2)
+            return data_cache
+
+    try:
+        data = obtener_rain_map_open_meteo(horizon_hours)
+
+        data["_cache"] = False
+        data["_cache_estado"] = "consulta_nueva_open_meteo"
+        data["_cache_edad_minutos"] = 0
+
+        RAIN_MAP_CACHE[cache_key_open] = {
+            "fecha": ahora,
+            "data": data
+        }
+
+        return data
+
+    except Exception as error_open_meteo:
+
+        # ====================================================
+        # 2. SI OPEN-METEO FALLA, INTENTAR MET NORWAY
+        # ====================================================
+
+        cache_key_met = f"rain_map_met_norway_h{horizon_hours}"
+
+        if cache_key_met in RAIN_MAP_CACHE:
+            cache = RAIN_MAP_CACHE[cache_key_met]
+            minutos = (ahora - cache["fecha"]).total_seconds() / 60
+
+            if minutos < 180:
+                data_cache = cache["data"].copy()
+                data_cache["_cache"] = True
+                data_cache["_cache_estado"] = "cache_vigente_met_norway"
+                data_cache["_cache_edad_minutos"] = round(minutos, 2)
+                data_cache["erroresFuentes"] = [
+                    f"open_meteo_rain_map: {type(error_open_meteo).__name__}: {str(error_open_meteo)}"
+                ]
+                return data_cache
+
+        try:
+            data = obtener_rain_map_met_norway(horizon_hours)
+
+            data["_cache"] = False
+            data["_cache_estado"] = "consulta_nueva_met_norway"
+            data["_cache_edad_minutos"] = 0
+            data["erroresFuentes"] = [
+                f"open_meteo_rain_map: {type(error_open_meteo).__name__}: {str(error_open_meteo)}"
+            ]
+
+            RAIN_MAP_CACHE[cache_key_met] = {
+                "fecha": ahora,
+                "data": data
+            }
+
+            return data
+
+        except Exception as error_met_norway:
+
+            # ================================================
+            # 3. FALLBACK TEMPORAL FINAL
+            # ================================================
+
+            fallback = crear_rain_map_fallback(horizon_hours)
+
+            fallback["erroresFuentes"] = [
+                f"open_meteo_rain_map: {type(error_open_meteo).__name__}: {str(error_open_meteo)}",
+                f"met_norway_rain_map: {type(error_met_norway).__name__}: {str(error_met_norway)}"
+            ]
+
+            return fallback
 
 def obtener_datos_actuales_mariato():
     """
@@ -1519,6 +1918,11 @@ def current_prediction():
 @app.get("/rain-map")
 def rain_map(horizon_hours: int = 0):
     return obtener_rain_map_operativo(horizon_hours)
+
+
+@app.get("/rain-map-met-debug")
+def rain_map_met_debug(horizon_hours: int = 0):
+    return obtener_rain_map_met_norway(horizon_hours)
 
 @app.get("/weather-debug")
 def weather_debug():
