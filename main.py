@@ -122,41 +122,15 @@ RAIN_MAP_CACHE = {}
 
 MET_NORWAY_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
 
-# IMPORTANTE:
-# Cambia este correo por uno real tuyo o del proyecto.
-# MET Norway exige User-Agent identificable.
+# MET Norway exige un User-Agent identificable.
 MET_NORWAY_USER_AGENT = "PLUVIAP/1.0 contacto:marioluisluismario@gmail.com"
 
-# ============================================================
-# ZONAS MONITOREADAS PARA MAPA DE LLUVIA - RAINSCREEN
-# ============================================================
 
-RAIN_ZONES_MARIATO = [
-    {"nombre": "Mariato", "lat": 7.6500, "lon": -81.0000},
-    {"nombre": "Loma de Quebro", "lat": 7.5600, "lon": -80.9700},
-    {"nombre": "Río Quebro", "lat": 7.5400, "lon": -80.9800},
-    {"nombre": "Río Pavo", "lat": 7.4700, "lon": -80.9900},
-    {"nombre": "Arenas", "lat": 7.6000, "lon": -80.9000},
-    {"nombre": "El Cacao", "lat": 7.4300, "lon": -80.8800},
-    {"nombre": "Palo Seco / costa", "lat": 7.6200, "lon": -81.0700},
-    {"nombre": "Tebario", "lat": 7.7200, "lon": -80.9500},
-]
-
-            # ============================================================
-            # CACHE SIMPLE PARA EVITAR EXCESO DE CONSULTAS A APIs EXTERNAS
-            # ============================================================
+# ============================================================
+# CACHE SIMPLE PARA EVITAR EXCESO DE CONSULTAS A APIs EXTERNAS
+# ============================================================
 
 CACHE_FUENTES = {}
-
-# ============================================================
-# CONFIGURACIÓN MET NORWAY API - RESPALDO PARA RAINSCREEN
-# ============================================================
-
-MET_NORWAY_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
-
-# Cambia el correo por uno real del proyecto.
-MET_NORWAY_USER_AGENT = "PLUVIAP/1.0 contacto:tu_correo@correo.com"
-
 def obtener_con_cache(nombre, ttl_minutos, funcion):
     """
     Ejecuta una función externa usando caché temporal.
@@ -1287,172 +1261,6 @@ def obtener_sistema_tropical_nhc():
             "detalle_ciclones": "error_consulta"
         }
     
-# ============================================================
-# FUNCIONES PARA MAPA DE LLUVIA - RAINSCREEN
-# ============================================================
-
-def clasificar_lluvia_mm(mm: float) -> str:
-    if mm < 0.1:
-        return "sin_lluvia"
-    elif mm < 1:
-        return "mínima"
-    elif mm < 5:
-        return "baja"
-    elif mm < 15:
-        return "moderada"
-    elif mm < 25:
-        return "fuerte"
-    else:
-        return "intensa"
-
-
-def crear_rain_map_fallback(horizon_hours: int = 0):
-    """
-    Respaldo temporal para RainScreen si Open-Meteo falla.
-    No representa medición real; solo evita que la app se rompa.
-    """
-
-    ahora = datetime.now()
-    proxima = ahora + timedelta(hours=3)
-
-    zonas = [
-        {
-            "nombre": z["nombre"],
-            "lat": z["lat"],
-            "lon": z["lon"],
-            "precipitacionMm": 0.0,
-            "nivel": "sin_datos"
-        }
-        for z in RAIN_ZONES_MARIATO
-    ]
-
-    return {
-        "fechaActualizacion": ahora.strftime("%Y-%m-%d %H:%M:%S"),
-        "proximaActualizacion": proxima.strftime("%Y-%m-%d %H:%M:%S"),
-        "unidad": "mm",
-        "horizonteHoras": horizon_hours,
-        "fuenteDatos": "fallback_temporal",
-        "mensaje": "No se pudo consultar Open-Meteo. Vista temporal sin lluvia real.",
-        "zonas": zonas
-    }
-
-
-def obtener_rain_map_open_meteo(horizon_hours: int = 0):
-    """
-    Consulta Open-Meteo para varias zonas de Mariato y calcula
-    la precipitación acumulada aproximada en una ventana de 3 horas.
-
-    horizon_hours:
-    0  = próximas 3 horas
-    3  = de +3h a +6h
-    6  = de +6h a +9h
-    9  = de +9h a +12h
-    12 = de +12h a +15h
-    """
-
-    horizon_hours = int(horizon_hours)
-
-    if horizon_hours not in [0, 3, 6, 9, 12]:
-        horizon_hours = 0
-
-    url = "https://api.open-meteo.com/v1/forecast"
-
-    latitudes = ",".join([str(z["lat"]) for z in RAIN_ZONES_MARIATO])
-    longitudes = ",".join([str(z["lon"]) for z in RAIN_ZONES_MARIATO])
-
-    params = {
-        "latitude": latitudes,
-        "longitude": longitudes,
-        "hourly": "precipitation",
-        "forecast_days": 2,
-        "timezone": TIMEZONE_MARIATO
-    }
-
-    response = requests.get(url, params=params, timeout=25)
-    response.raise_for_status()
-
-    data = response.json()
-
-    # Cuando se consultan varias coordenadas, Open-Meteo devuelve una lista.
-    if isinstance(data, dict):
-        data = [data]
-
-    ahora = datetime.now()
-    inicio_ventana = ahora + timedelta(hours=horizon_hours)
-    fin_ventana = inicio_ventana + timedelta(hours=3)
-
-    zonas_resultado = []
-
-    for idx, zona_data in enumerate(data):
-        if idx >= len(RAIN_ZONES_MARIATO):
-            continue
-
-        zona_info = RAIN_ZONES_MARIATO[idx]
-
-        hourly = zona_data.get("hourly", {})
-        times = hourly.get("time", [])
-        precipitation = hourly.get("precipitation", [])
-
-        acumulado = 0.0
-
-        for t, p in zip(times, precipitation):
-            try:
-                fecha_hora = datetime.fromisoformat(t)
-                valor = float(p or 0.0)
-
-                if inicio_ventana <= fecha_hora < fin_ventana:
-                    acumulado += valor
-
-            except Exception:
-                continue
-
-        acumulado = round(float(acumulado), 2)
-
-        zonas_resultado.append({
-            "nombre": zona_info["nombre"],
-            "lat": zona_info["lat"],
-            "lon": zona_info["lon"],
-            "precipitacionMm": acumulado,
-            "nivel": clasificar_lluvia_mm(acumulado)
-        })
-
-    return {
-        "fechaActualizacion": ahora.strftime("%Y-%m-%d %H:%M:%S"),
-        "proximaActualizacion": (ahora + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
-        "unidad": "mm",
-        "horizonteHoras": horizon_hours,
-        "fuenteDatos": "Open-Meteo",
-        "mensaje": "Precipitación estimada por zonas monitoreadas.",
-        "zonas": zonas_resultado
-    }
-
-
-def obtener_rain_map_operativo(horizon_hours: int = 0):
-    """
-    Obtiene mapa de lluvia por zonas con caché de 3 horas.
-    """
-
-    horizon_hours = int(horizon_hours)
-
-    if horizon_hours not in [0, 3, 6, 9, 12]:
-        horizon_hours = 0
-
-    cache_key = f"rain_map_open_meteo_h{horizon_hours}"
-
-    try:
-        resultado = obtener_con_cache(
-            nombre=cache_key,
-            ttl_minutos=180,
-            funcion=lambda: obtener_rain_map_open_meteo(horizon_hours)
-        )
-
-        return resultado
-
-    except Exception as e:
-        fallback = crear_rain_map_fallback(horizon_hours)
-        fallback["error"] = f"{type(e).__name__}: {str(e)}"
-        return fallback
-
 # ============================================================
 # FUNCIONES AUXILIARES
 # ============================================================
