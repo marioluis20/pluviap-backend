@@ -392,57 +392,364 @@ def obtener_lluvia_nasa_power():
             "nota": "NASA POWER se usa como respaldo cuando Open-Meteo falla o devuelve 429."
         }
     }
+def obtener_lluvia_met_norway_mariato():
+    """
+    Consulta MET Norway para Mariato centro.
+    Se usa como confirmación horaria de lluvia próxima.
+    
+    No reemplaza Open-Meteo.
+    Sirve para saber si otra fuente horaria confirma lluvia cercana.
+    """
+
+    ahora_utc = datetime.now(timezone.utc)
+
+    headers = {
+        "User-Agent": MET_NORWAY_USER_AGENT,
+        "Accept": "application/json"
+    }
+
+    params = {
+        "lat": LAT_MARIATO,
+        "lon": LON_MARIATO
+    }
+
+    response = requests.get(
+        MET_NORWAY_URL,
+        params=params,
+        headers=headers,
+        timeout=25
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    timeseries = (
+        data
+        .get("properties", {})
+        .get("timeseries", [])
+    )
+
+    if not timeseries:
+        raise ValueError("MET Norway no devolvió timeseries.")
+
+    lluvia_3h = 0.0
+    lluvia_6h = 0.0
+    lluvia_12h = 0.0
+
+    respaldo_6h = None
+    respaldo_12h = None
+
+    for item in timeseries:
+        try:
+            tiempo = parsear_fecha_met_norway(item["time"])
+            data_item = item.get("data", {})
+
+            next_1h = data_item.get("next_1_hours")
+            if next_1h:
+                detalles = next_1h.get("details", {})
+                lluvia_1h = float(detalles.get("precipitation_amount", 0.0) or 0.0)
+
+                if ahora_utc <= tiempo < ahora_utc + timedelta(hours=3):
+                    lluvia_3h += lluvia_1h
+
+                if ahora_utc <= tiempo < ahora_utc + timedelta(hours=6):
+                    lluvia_6h += lluvia_1h
+
+                if ahora_utc <= tiempo < ahora_utc + timedelta(hours=12):
+                    lluvia_12h += lluvia_1h
+
+            next_6h = data_item.get("next_6_hours")
+            if next_6h and respaldo_6h is None:
+                detalles_6h = next_6h.get("details", {})
+                respaldo_6h = float(detalles_6h.get("precipitation_amount", 0.0) or 0.0)
+
+            next_12h = data_item.get("next_12_hours")
+            if next_12h and respaldo_12h is None:
+                detalles_12h = next_12h.get("details", {})
+                respaldo_12h = float(detalles_12h.get("precipitation_amount", 0.0) or 0.0)
+
+        except Exception:
+            continue
+
+    if lluvia_6h == 0.0 and respaldo_6h is not None:
+        lluvia_6h = respaldo_6h
+
+    if lluvia_12h == 0.0 and respaldo_12h is not None:
+        lluvia_12h = respaldo_12h
+
+    return {
+        "lluvia_3h": round(float(lluvia_3h), 2),
+        "lluvia_6h": round(float(lluvia_6h), 2),
+        "lluvia_12h": round(float(lluvia_12h), 2),
+        "fuente_met": "MET Norway",
+        "detalle_met": {
+            "tipo": "pronostico_horario_confirmacion",
+            "nota": "MET Norway se usa como confirmación secundaria de lluvia próxima."
+        }
+    }
+
+def evaluar_consenso_lluvia(open_meteo, nasa_power, met_norway, fuente_operativa):
+    """
+    Compara Open-Meteo, NASA POWER y MET Norway.
+    
+    No promedia ciegamente.
+    Evalúa coincidencia, discrepancia y certeza de datos.
+    """
+
+    open_ok = isinstance(open_meteo, dict)
+    nasa_ok = isinstance(nasa_power, dict)
+    met_ok = isinstance(met_norway, dict)
+
+    comparacion = {
+        "openMeteo": {
+            "disponible": open_ok,
+            "lluvia1d": open_meteo.get("lluvia_1d") if open_ok else None,
+            "lluvia3d": open_meteo.get("lluvia_3d") if open_ok else None,
+            "lluvia7d": open_meteo.get("lluvia_7d") if open_ok else None
+        },
+        "nasaPower": {
+            "disponible": nasa_ok,
+            "lluvia1d": nasa_power.get("lluvia_1d") if nasa_ok else None,
+            "lluvia3d": nasa_power.get("lluvia_3d") if nasa_ok else None,
+            "lluvia7d": nasa_power.get("lluvia_7d") if nasa_ok else None,
+            "ultimoDia": (
+                nasa_power
+                .get("detalle_lluvia", {})
+                .get("ultimo_dia")
+                if nasa_ok else None
+            )
+        },
+        "metNorway": {
+            "disponible": met_ok,
+            "lluvia3h": met_norway.get("lluvia_3h") if met_ok else None,
+            "lluvia6h": met_norway.get("lluvia_6h") if met_ok else None,
+            "lluvia12h": met_norway.get("lluvia_12h") if met_ok else None
+        },
+        "diferencias": {}
+    }
+
+    advertencias = []
+    consenso = "sin_comparacion"
+    certeza = "media"
+    limitar_roja = False
+
+    # ========================================================
+    # Diferencia Open-Meteo vs NASA POWER
+    # ========================================================
+
+    discrepancia_open_nasa = False
+
+    if open_ok and nasa_ok:
+        dif_1d = round(float(nasa_power.get("lluvia_1d", 0)) - float(open_meteo.get("lluvia_1d", 0)), 2)
+        dif_3d = round(float(nasa_power.get("lluvia_3d", 0)) - float(open_meteo.get("lluvia_3d", 0)), 2)
+        dif_7d = round(float(nasa_power.get("lluvia_7d", 0)) - float(open_meteo.get("lluvia_7d", 0)), 2)
+
+        comparacion["diferencias"] = {
+            "nasaMenosOpenMeteo1d": dif_1d,
+            "nasaMenosOpenMeteo3d": dif_3d,
+            "nasaMenosOpenMeteo7d": dif_7d
+        }
+
+        if abs(dif_1d) >= 25 or abs(dif_3d) >= 50 or abs(dif_7d) >= 70:
+            discrepancia_open_nasa = True
+            advertencias.append(
+                "NASA POWER y Open-Meteo presentan diferencias importantes en los acumulados de lluvia."
+            )
+
+    # ========================================================
+    # Confirmación horaria por MET Norway
+    # ========================================================
+
+    met_confirma_lluvia_fuerte = False
+    met_confirma_lluvia_moderada = False
+
+    if met_ok:
+        lluvia_3h_met = float(met_norway.get("lluvia_3h", 0) or 0)
+        lluvia_6h_met = float(met_norway.get("lluvia_6h", 0) or 0)
+        lluvia_12h_met = float(met_norway.get("lluvia_12h", 0) or 0)
+
+        if lluvia_3h_met >= 15 or lluvia_6h_met >= 25 or lluvia_12h_met >= 40:
+            met_confirma_lluvia_fuerte = True
+
+        elif lluvia_3h_met >= 5 or lluvia_6h_met >= 10 or lluvia_12h_met >= 20:
+            met_confirma_lluvia_moderada = True
+
+    # ========================================================
+    # Clasificación del consenso
+    # ========================================================
+
+    if fuente_operativa == "Open-Meteo" and open_ok:
+        if discrepancia_open_nasa:
+            consenso = "open_meteo_principal_con_discrepancia_nasa"
+            certeza = "media"
+        else:
+            consenso = "open_meteo_principal"
+            certeza = "alta"
+
+        if met_ok and met_confirma_lluvia_moderada:
+            advertencias.append(
+                "MET Norway confirma lluvia próxima moderada; mantener monitoreo."
+            )
+
+        if met_ok and met_confirma_lluvia_fuerte:
+            advertencias.append(
+                "MET Norway confirma lluvia próxima fuerte; aumentar vigilancia."
+            )
+            certeza = "media_alta"
+
+    elif fuente_operativa == "NASA POWER" and nasa_ok:
+        if met_ok and met_confirma_lluvia_fuerte:
+            consenso = "nasa_power_respaldado_por_met_norway"
+            certeza = "media"
+            limitar_roja = False
+        else:
+            consenso = "nasa_power_sin_confirmacion_horaria"
+            certeza = "media_baja"
+            limitar_roja = True
+            advertencias.append(
+                "NASA POWER reporta acumulados altos, pero no hay confirmación horaria fuerte de MET Norway."
+            )
+
+    elif fuente_operativa == "respaldo_local_lluvia":
+        consenso = "sin_fuentes_confiables_lluvia"
+        certeza = "baja"
+        limitar_roja = True
+        advertencias.append(
+            "No se pudieron consultar fuentes confiables de lluvia; se usa respaldo local."
+        )
+
+    else:
+        consenso = "fuente_lluvia_no_clasificada"
+        certeza = "media_baja"
+
+    return {
+        "consenso": consenso,
+        "certeza": certeza,
+        "advertencia": " ".join(advertencias) if advertencias else None,
+        "limitarRojaPorBajaConfirmacion": limitar_roja,
+        "metConfirmaLluviaModerada": met_confirma_lluvia_moderada,
+        "metConfirmaLluviaFuerte": met_confirma_lluvia_fuerte,
+        "comparacion": comparacion
+    }
 
 def obtener_lluvia_operativa():
     """
-    Obtiene lluvia para PLUVIAP con estrategia robusta:
+    Obtiene lluvia para PLUVIAP con consenso de fuentes:
 
-    1. Intenta Open-Meteo con caché.
-    2. Si Open-Meteo falla, usa NASA POWER con caché.
-    3. Si ambas fallan, devuelve ok=False para que el sistema use respaldo local.
+    1. Consulta Open-Meteo como fuente principal.
+    2. Consulta NASA POWER como comparación diaria/acumulada.
+    3. Consulta MET Norway como confirmación horaria próxima.
+    4. Decide fuente operativa sin depender ciegamente de una sola fuente.
     """
 
+    error_open = None
+    error_nasa = None
+    error_met = None
+
+    open_meteo = None
+    nasa_power = None
+    met_norway = None
+
+    # ========================================================
+    # 1. OPEN-METEO
+    # ========================================================
+
     try:
-        lluvia = obtener_con_cache(
+        open_meteo = obtener_con_cache(
             nombre="lluvia_open_meteo",
             ttl_minutos=60,
             funcion=obtener_lluvia_open_meteo
         )
+    except Exception as e:
+        error_open = f"{type(e).__name__}: {str(e)}"
 
+    # ========================================================
+    # 2. NASA POWER
+    # ========================================================
+
+    try:
+        nasa_power = obtener_con_cache(
+            nombre="lluvia_nasa_power",
+            ttl_minutos=360,
+            funcion=obtener_lluvia_nasa_power
+        )
+    except Exception as e:
+        error_nasa = f"{type(e).__name__}: {str(e)}"
+
+    # ========================================================
+    # 3. MET NORWAY
+    # ========================================================
+
+    try:
+        met_norway = obtener_con_cache(
+            nombre="lluvia_met_norway_mariato",
+            ttl_minutos=60,
+            funcion=obtener_lluvia_met_norway_mariato
+        )
+    except Exception as e:
+        error_met = f"{type(e).__name__}: {str(e)}"
+
+    # ========================================================
+    # 4. SELECCIÓN DE FUENTE OPERATIVA
+    # ========================================================
+
+    if open_meteo is not None:
+        fuente_operativa = "Open-Meteo"
+        lluvia_operativa = open_meteo
+        ok = True
+
+    elif nasa_power is not None:
+        fuente_operativa = "NASA POWER"
+        lluvia_operativa = nasa_power
+        ok = True
+
+    else:
+        fuente_operativa = "sin_fuente_lluvia"
+        lluvia_operativa = None
+        ok = False
+
+    consenso = evaluar_consenso_lluvia(
+        open_meteo=open_meteo,
+        nasa_power=nasa_power,
+        met_norway=met_norway,
+        fuente_operativa=fuente_operativa
+    )
+
+    if ok:
         return {
             "ok": True,
-            "fuente": "Open-Meteo",
-            "resultado": lluvia,
-            "error_primario": None
+            "fuente": fuente_operativa,
+            "resultado": lluvia_operativa,
+            "error_primario": error_open,
+            "error_secundario": error_nasa,
+            "error_met_norway": error_met,
+            "consenso_lluvia": {
+                "consenso": consenso["consenso"],
+                "certeza": consenso["certeza"],
+                "advertencia": consenso["advertencia"],
+                "limitarRojaPorBajaConfirmacion": consenso["limitarRojaPorBajaConfirmacion"],
+                "metConfirmaLluviaModerada": consenso["metConfirmaLluviaModerada"],
+                "metConfirmaLluviaFuerte": consenso["metConfirmaLluviaFuerte"]
+            },
+            "comparacion_fuentes": consenso["comparacion"]
         }
 
-    except Exception as e_open:
-        error_open = f"{type(e_open).__name__}: {str(e_open)}"
-
-        try:
-            lluvia = obtener_con_cache(
-                nombre="lluvia_nasa_power",
-                ttl_minutos=360,
-                funcion=obtener_lluvia_nasa_power
-            )
-
-            return {
-                "ok": True,
-                "fuente": "NASA POWER",
-                "resultado": lluvia,
-                "error_primario": error_open
-            }
-
-        except Exception as e_nasa:
-            error_nasa = f"{type(e_nasa).__name__}: {str(e_nasa)}"
-
-            return {
-                "ok": False,
-                "fuente": "sin_fuente_lluvia",
-                "resultado": None,
-                "error_primario": error_open,
-                "error_secundario": error_nasa
-            }
+    return {
+        "ok": False,
+        "fuente": "sin_fuente_lluvia",
+        "resultado": None,
+        "error_primario": error_open,
+        "error_secundario": error_nasa,
+        "error_met_norway": error_met,
+        "consenso_lluvia": {
+            "consenso": consenso["consenso"],
+            "certeza": consenso["certeza"],
+            "advertencia": consenso["advertencia"],
+            "limitarRojaPorBajaConfirmacion": True
+        },
+        "comparacion_fuentes": consenso["comparacion"]
+    }
 
 def calcular_api_proxy_lluvia(lluvia_1d, lluvia_3d, lluvia_7d):
     """
@@ -868,6 +1175,9 @@ def obtener_datos_actuales_mariato():
         }
 
         fuente_lluvia = "respaldo_local_lluvia"
+    
+    consenso_lluvia = lluvia_operativa.get("consenso_lluvia", {})
+    comparacion_fuentes_lluvia = lluvia_operativa.get("comparacion_fuentes", {})
 
     # =========================
     # ENSO - NOAA CPC
@@ -972,7 +1282,9 @@ def obtener_datos_actuales_mariato():
         "cache_marea": marea.get("_cache_estado"),
         "cache_ciclones": ciclon.get("_cache_estado"),
 
-        "errores_fuentes": errores_fuentes
+        "errores_fuentes": errores_fuentes,
+        "consenso_lluvia": consenso_lluvia,
+        "comparacion_fuentes_lluvia": comparacion_fuentes_lluvia,
     }
 
     return datos
@@ -1502,6 +1814,66 @@ def generar_mensaje(alerta):
         return "Alerta crítica. Siga instrucciones de las autoridades."
     return "Estado no disponible."
 
+def aplicar_consenso_a_respuesta(respuesta, datos_usuario):
+    """
+    Ajusta la respuesta final según el consenso de fuentes.
+    
+    Regla principal:
+    NASA POWER no puede activar alerta roja por sí sola si no hay
+    confirmación horaria fuerte y no hay agravantes físicos.
+    """
+
+    fuentes = datos_usuario.get("_fuentes", {})
+    consenso = fuentes.get("consenso_lluvia", {}) or {}
+
+    limitar_roja = consenso.get("limitarRojaPorBajaConfirmacion", False)
+    fuente_lluvia = fuentes.get("lluvia")
+
+    marea_alta = int(datos_usuario.get("marea_alta", 0) or 0)
+    sistema_tropical = int(datos_usuario.get("sistema_tropical_activo", 0) or 0)
+
+    respuesta["consensoFuentes"] = consenso.get("consenso")
+    respuesta["certezaDatos"] = consenso.get("certeza")
+    respuesta["advertenciaDatos"] = consenso.get("advertencia")
+    respuesta["alertaAjustadaPorConsenso"] = False
+
+    # Solo limitamos roja si:
+    # - la alerta llegó a roja
+    # - la lluvia viene de NASA POWER o respaldo
+    # - el consenso dice que no hay confirmación suficiente
+    # - no hay marea alta
+    # - no hay sistema tropical activo
+
+    if (
+        respuesta.get("alertaFinal") == "roja"
+        and limitar_roja
+        and fuente_lluvia in ["NASA POWER", "respaldo_local_lluvia", "sin_fuente_lluvia"]
+        and marea_alta == 0
+        and sistema_tropical == 0
+    ):
+        respuesta["alertaFinal"] = "amarilla"
+        respuesta["estadoTitulo"] = "PREPARACIÓN"
+        respuesta["mensaje"] = (
+            "Alerta preventiva por acumulados altos en fuente de respaldo. "
+            "Verifique condiciones locales y fuentes oficiales."
+        )
+        respuesta["riesgoTexto"] = "Moderado"
+        respuesta["tendencia"] = "Elevada"
+        respuesta["alertaAjustadaPorConsenso"] = True
+
+        if "razonesFinales" not in respuesta or respuesta["razonesFinales"] is None:
+            respuesta["razonesFinales"] = []
+
+        respuesta["razonesFinales"].append(
+            "roja_limitada_por_consenso_baja_confirmacion"
+        )
+
+        respuesta["probabilidadOperativa"] = min(
+            float(respuesta.get("probabilidadOperativa", 0) or 0),
+            0.58
+        )
+
+    return respuesta
 
 def tendencia_por_probabilidad(prob):
     if prob < 0.30:
@@ -1681,6 +2053,7 @@ def current_prediction():
     try:
         datos = obtener_datos_actuales_mariato()
         respuesta = predecir_v21(datos)
+        respuesta = aplicar_consenso_a_respuesta(respuesta, datos)
 
         fuentes = datos.get("_fuentes", {})
 
@@ -1697,6 +2070,7 @@ def current_prediction():
         respuesta["cacheMarea"] = fuentes.get("cache_marea")
         respuesta["cacheCiclones"] = fuentes.get("cache_ciclones")
         respuesta["erroresFuentes"] = fuentes.get("errores_fuentes", [])
+        respuesta["comparacionFuentes"] = fuentes.get("comparacion_fuentes_lluvia", {})
 
         respuesta["mareaEstado"] = fuentes.get(
             "marea_estado",
@@ -1836,6 +2210,23 @@ def sources_debug():
         "ciclones_noaa_nhc": ciclon
     }
 
+@app.get("/rain-consensus-debug")
+def rain_consensus_debug():
+    lluvia = obtener_lluvia_operativa()
+
+    return {
+        "ubicacion": "Mariato, Veraguas, Panamá",
+        "fechaConsulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "fuenteOperativa": lluvia.get("fuente"),
+        "resultadoOperativo": lluvia.get("resultado"),
+        "consensoLluvia": lluvia.get("consenso_lluvia"),
+        "comparacionFuentes": lluvia.get("comparacion_fuentes"),
+        "errores": {
+            "openMeteo": lluvia.get("error_primario"),
+            "nasaPower": lluvia.get("error_secundario"),
+            "metNorway": lluvia.get("error_met_norway")
+        }
+    }
 
 @app.get("/routes-debug")
 def routes_debug():
