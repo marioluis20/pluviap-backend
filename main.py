@@ -10,6 +10,7 @@ import numpy as np
 import joblib
 import requests
 import re
+import os
 
 
 # ============================================================
@@ -95,6 +96,18 @@ class SimplePredictionRequest(BaseModel):
 LAT_MARIATO = 7.65
 LON_MARIATO = -81.00
 TIMEZONE_MARIATO = "America/Panama"
+
+# ============================================================
+# OPEN-METEO COMERCIAL
+# ============================================================
+
+OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY")
+
+OPEN_METEO_FORECAST_URL = (
+    "https://customer-api.open-meteo.com/v1/forecast"
+    if OPEN_METEO_API_KEY
+    else "https://api.open-meteo.com/v1/forecast"
+)
 
 # ============================================================
 # CONFIGURACIÓN RAIN MAP - ZONAS DE MARIATO
@@ -215,7 +228,7 @@ def obtener_lluvia_open_meteo():
     Esto permite que PLUVIAP reaccione tanto a lluvia reciente como a lluvia esperada.
     """
 
-    url = "https://api.open-meteo.com/v1/forecast"
+    url = OPEN_METEO_FORECAST_URL
 
     params = {
         "latitude": LAT_MARIATO,
@@ -225,6 +238,8 @@ def obtener_lluvia_open_meteo():
         "forecast_days": 7,
         "timezone": TIMEZONE_MARIATO
     }
+    if OPEN_METEO_API_KEY:
+        params["apikey"] = OPEN_METEO_API_KEY
 
     response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
@@ -529,7 +544,7 @@ def obtener_rain_map_open_meteo(horizon_hours: int = 0):
     if horizon_hours not in [0, 3, 6, 9, 12]:
         horizon_hours = 0
 
-    url = "https://api.open-meteo.com/v1/forecast"
+    url = OPEN_METEO_FORECAST_URL
 
     latitudes = ",".join(str(z["lat"]) for z in RAIN_ZONES_MARIATO)
     longitudes = ",".join(str(z["lon"]) for z in RAIN_ZONES_MARIATO)
@@ -541,6 +556,8 @@ def obtener_rain_map_open_meteo(horizon_hours: int = 0):
         "forecast_days": 2,
         "timezone": TIMEZONE_MARIATO
     }
+    if OPEN_METEO_API_KEY:
+        params["apikey"] = OPEN_METEO_API_KEY
 
     response = requests.get(url, params=params, timeout=25)
     response.raise_for_status()
@@ -1827,4 +1844,12 @@ def routes_debug():
             route.path
             for route in app.routes
         ]
+    }
+
+@app.get("/open-meteo-config-debug")
+def open_meteo_config_debug():
+    return {
+        "open_meteo_api_key_configurada": bool(OPEN_METEO_API_KEY),
+        "open_meteo_forecast_url": OPEN_METEO_FORECAST_URL,
+        "modo": "comercial" if OPEN_METEO_API_KEY else "gratuito"
     }
