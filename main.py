@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 from pathlib import Path
+from rain_map_v2 import router as rain_map_v2_router
 
 import pandas as pd
 import numpy as np
@@ -58,6 +59,8 @@ app = FastAPI(
     description="API para predicción de riesgo de inundaciones en Mariato usando modelo V2.1",
     version="1.0.0"
 )
+
+app.include_router(rain_map_v2_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -2230,11 +2233,25 @@ def rain_consensus_debug():
 
 @app.get("/routes-debug")
 def routes_debug():
+    rutas = []
+
+    for route in app.routes:
+        path = getattr(route, "path", None)
+
+        if path is None:
+            continue
+
+        methods = getattr(route, "methods", None)
+
+        rutas.append({
+            "path": path,
+            "methods": sorted(list(methods)) if methods else [],
+            "name": getattr(route, "name", None)
+        })
+
     return {
-        "routes": [
-            route.path
-            for route in app.routes
-        ]
+        "total": len(rutas),
+        "routes": rutas
     }
 
 @app.get("/open-meteo-config-debug")
